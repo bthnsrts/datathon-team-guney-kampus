@@ -1,0 +1,34 @@
+# Configuration settings for the project
+
+data:
+  path: "data/"
+  format: "csv"
+
+notebooks:
+  path: "notebooks/"
+
+utils:
+  path: "utils/"
+
+logs:
+  path: "logs/"
+  level: "INFO"
+
+parameters:
+  learning_rate: 0.001
+  batch_size: 32
+  num_epochs: 100
+
+model:
+  type: "neural_network"
+  architecture:
+    layers:
+      - type: "dense"
+        units: 128
+        activation: "relu"
+      - type: "dense"
+        units: 64
+        activation: "relu"
+      - type: "output"
+        units: 10
+        activation: "softmax"
