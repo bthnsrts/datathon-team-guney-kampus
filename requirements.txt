@@ -1,0 +1,7 @@
+# Python dependencies for ING Datathon project
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+jupyter

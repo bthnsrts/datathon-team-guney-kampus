@@ -1,0 +1,16 @@
+# Configuration file for ING Datathon project
+
+# Data paths
+data:
+  raw_data_path: "data/raw/"
+  processed_data_path: "data/processed/"
+  
+# Model parameters
+model:
+  random_state: 42
+  test_size: 0.2
+
+# Logging
+logging:
+  log_dir: "logs/"
+  log_level: "INFO"
