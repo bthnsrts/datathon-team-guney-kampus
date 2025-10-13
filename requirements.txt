@@ -28,7 +28,6 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.10
--e git+https://github.com/bthnsrts/ing-datathon-team-guney-kampus.git@8406fdc462be6240f6aac3132da8840d0faac553#egg=ing_datathon
 iniconfig==2.1.0
 ipykernel==6.30.1
 ipython==8.37.0
@@ -75,7 +74,6 @@ parso==0.8.5
 pexpect==4.9.0
 pillow==11.3.0
 platformdirs==4.5.0
-pluggy==1.6.0
 prometheus_client==0.23.1
 prompt_toolkit==3.0.52
 protobuf==6.32.1
@@ -85,7 +83,6 @@ pure_eval==0.2.3
 pycparser==2.23
 Pygments==2.19.2
 pyparsing==3.2.5
-pytest==8.4.2
 python-dateutil==2.9.0.post0
 python-json-logger==4.0.0
 python-slugify==8.0.4
@@ -94,7 +91,7 @@ PyYAML==6.0.3
 pyzmq==27.1.0
 referencing==0.36.2
 requests==2.32.5
-rfc3339-validator==0.1.4
+rfc3339-validator==0.1.4 
 rfc3986-validator==0.1.1
 rfc3987-syntax==1.1.0
 rpds-py==0.27.1
@@ -124,3 +121,4 @@ webcolors==24.11.1
 webencodings==0.5.1
 websocket-client==1.9.0
 widgetsnbextension==4.0.14
+pytest>=7.0.0
