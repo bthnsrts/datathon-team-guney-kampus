@@ -36,3 +36,6 @@ data/
 # Log files
 logs/
 *.log
+
+# Testing
+.pytest_cache/
