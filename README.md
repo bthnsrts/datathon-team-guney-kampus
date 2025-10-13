@@ -17,6 +17,7 @@ my-project
 ├── .gitignore    # Files and directories to be ignored by Git
 ├── Makefile      # Automation tasks for build and management
 ├── requirements.txt # List of required Python packages
+├── setup.py      # Installation script for the package
 └── README.md     # Documentation for the project
 ```
 
@@ -82,6 +83,28 @@ my-project
    unzip ing-hubs-turkiye-datathon.zip -d data/
    rm ing-hubs-turkiye-datathon.zip
    ```
+
+7. Notebooks and other scripts use the utils package, in order to enable this;
+   ```bash
+   pip install -e .
+   ```
+   This will:
+   - Install the utils as a package in development mode
+   - Allow you to make changes to the code without reinstalling
+
+## Dataset Explanation
+
+This project uses a banking customer dataset for churn prediction:
+
+- **customer_history.csv**: Monthly transaction history (EFT, credit card usage)
+- **customers.csv**: Demographic data (age, gender, work info)
+- **reference_data.csv**: Training data with churn labels
+- **reference_data_test.csv**: Test customers requiring churn prediction
+- **sample_submission.csv**: Submission format template
+
+The goal is to predict customer churn (whether a customer will leave) within 6 months after the reference date. Churn is indicated as 1 (customer left) or 0 (customer stayed).
+
+For detailed column descriptions, see [DATASET_EXPLANATION.md](./DATASET_EXPLANATION.md)
 
 ## Usage
 - To run the Jupyter notebooks, navigate to the `notebooks` folder and open the desired notebook.
