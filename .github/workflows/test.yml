@@ -21,10 +21,9 @@ jobs:
     
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install pytest pandas
-        # Add other dependencies from requirements.txt if you have one
-        # pip install -r requirements.txt
+            python -m pip install --upgrade pip
+            pip install pytest pandas
+            pip install -r requirements.txt
     
     - name: Run tests
       run: |
