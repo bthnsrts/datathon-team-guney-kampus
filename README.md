@@ -112,6 +112,29 @@ For detailed column descriptions, see [DATASET_EXPLANATION.md](./DATASET_EXPLANA
 - Use the utility functions in the `utils` folder as needed in your analysis.
 - Check the `logs` folder for any log files generated during execution.
 
+## Testing
+
+The project includes unit tests to ensure code quality and functionality. Tests are located in the project structure.
+
+### Running Tests
+
+To run the test for the `bucketize_sum_month_lags` function:
+
+```bash
+pytest tests/bucketize_sum_month_lags_test.py 
+```
+
+Or to run all tests:
+
+```bash
+pytest -q
+```
+
+The `bucketize_sum_month_lags_test` validates:
+- Correct binning of monthly lag features
+- Proper handling of edge cases and boundary values
+- Output format and data types
+
 ## Configuration
 Adjust the parameters in the `config.yml` file to customize the project settings.
 
