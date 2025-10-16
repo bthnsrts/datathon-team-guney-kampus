@@ -17,6 +17,7 @@ my-project
 ├── .gitignore    # Files and directories to be ignored by Git
 ├── Makefile      # Automation tasks for build and management
 ├── requirements.txt # List of required Python packages
+├── setup.py      # Installation script for the package
 └── README.md     # Documentation for the project
 ```
 
@@ -83,11 +84,56 @@ my-project
    rm ing-hubs-turkiye-datathon.zip
    ```
 
+7. Notebooks and other scripts use the utils package, in order to enable this;
+   ```bash
+   pip install -e .
+   ```
+   This will:
+   - Install the utils as a package in development mode
+   - Allow you to make changes to the code without reinstalling
+
+## Dataset Explanation
+
+This project uses a banking customer dataset for churn prediction:
+
+- **customer_history.csv**: Monthly transaction history (EFT, credit card usage)
+- **customers.csv**: Demographic data (age, gender, work info)
+- **reference_data.csv**: Training data with churn labels
+- **reference_data_test.csv**: Test customers requiring churn prediction
+- **sample_submission.csv**: Submission format template
+
+The goal is to predict customer churn (whether a customer will leave) within 6 months after the reference date. Churn is indicated as 1 (customer left) or 0 (customer stayed).
+
+For detailed column descriptions, see [DATASET_EXPLANATION.md](./DATASET_EXPLANATION.md)
+
 ## Usage
 - To run the Jupyter notebooks, navigate to the `notebooks` folder and open the desired notebook.
 - Choose the Python Interpreter for notebooks from virtual environment created.
 - Use the utility functions in the `utils` folder as needed in your analysis.
 - Check the `logs` folder for any log files generated during execution.
+
+## Testing
+
+The project includes unit tests to ensure code quality and functionality. Tests are located in the project structure.
+
+### Running Tests
+
+To run the test for the `bucketize_sum_month_lags` function:
+
+```bash
+pytest tests/bucketize_sum_month_lags_test.py 
+```
+
+Or to run all tests:
+
+```bash
+pytest -q
+```
+
+The `bucketize_sum_month_lags_test` validates:
+- Correct binning of monthly lag features
+- Proper handling of edge cases and boundary values
+- Output format and data types
 
 ## Configuration
 Adjust the parameters in the `config.yml` file to customize the project settings.
