@@ -1,20 +1,20 @@
 import warnings
+from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 import optuna
 
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
     accuracy_score, log_loss
 )
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+from catboost import CatBoostClassifier
 from sklearn.ensemble import RandomForestClassifier
 
 from imblearn.over_sampling import SMOTE, ADASYN, RandomOverSampler
 from imblearn.under_sampling import TomekLinks
-
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
 
 # -------------------
 # Custom ING Hubs metrics
@@ -78,242 +78,422 @@ def ing_hubs_datathon_metric(y_true, y_prob):
 # --------------------------------------------------
 # Main Optuna runner with sampling + custom metric
 # --------------------------------------------------
-def create_optuna_study_with_sampling(
-    X,
-    y,
-    sampler: str = None,                          # None | "SMOTE" | "ADASYN" | "RandomOversampling" | "TomekLinks"
-    model_name: str = "XGBoost",                  # "XGBoost" | "LightGBM" | "CatBoost" | "RandomForest"
-    loss: str = None,                             # model-specific objective; sensible default if None
-    eval_metric: str = "auc",                     # "auc" | "aucpr" | "f1" | "accuracy" | "logloss" | "ing_hubs"
-    class_weights = [0.5, 0.5],                   # warning if changed and sampler chosen
-    n_trials: int = 50,
-    random_state: int = 42,
-    use_gpu: bool = False,
-    n_splits: int = 5
-):
-    X = np.asarray(X)
-    y = np.asarray(y).astype(int)
-    assert set(np.unique(y)) <= {0, 1}, "Binary target {0,1} expected."
+class OptunaTuner:
+    """
+    Optuna-based hyperparameter tuner for binary classification with sampling support.
+    
+    Features:
+    - Multiple models: XGBoost, LightGBM, CatBoost, RandomForest
+    - Sampling methods: SMOTE, ADASYN, RandomOversampling, TomekLinks
+    - Flexible evaluation metrics (sklearn functions or custom callables)
+    - Cross-validation with stratified k-fold
+    """
+    
+    VALID_SAMPLERS = {None, "SMOTE", "ADASYN", "RandomOverSampler", "TomekLinks"}
+    VALID_MODELS = {"XGBoost", "LightGBM", "CatBoost", "RandomForest"}
+    
+    def __init__(
+        self,
+        model_name: str = "XGBoost",
+        sampler: Optional[str] = None,
+        loss: Optional[str] = None,
+        eval_metric: str = "roc_auc_score",
+        class_weights: List[float] = [0.5, 0.5],
+        n_trials: int = 50,
+        random_state: int = 42,
+        use_gpu: bool = False,
+        n_splits: int = 5,
+        study_name: Optional[str] = None,
+        show_progress_bar: bool = True
+    ):
+        """
+        Initialize the OptunaTuner.
+        
+        Parameters:
+        -----------
+        model_name : str
+            Model to use: "XGBoost", "LightGBM", "CatBoost", "RandomForest"
+        sampler : str, optional
+            Sampling method: None, "SMOTE", "ADASYN", "RandomOverSampler", "TomekLinks"
+        loss : str, optional
+            Model-specific objective/loss function (uses sensible defaults if None)
+        eval_metric : callable
+            Evaluation function for CV scoring. Can be:
+            - Sklearn metric function: roc_auc_score, f1_score, accuracy_score, etc.
+            - Custom function with signature: f(y_true, y_pred) -> float
+              OR f(y_true, y_pred_proba, y_pred_label) -> float
+            Default: roc_auc_score
+        class_weights : list
+            Class weights [weight_0, weight_1] for handling imbalance
+        n_trials : int
+            Number of Optuna trials
+        random_state : int
+            Random seed for reproducibility
+        use_gpu : bool
+            Whether to use GPU acceleration (if available)
+        n_splits : int
+            Number of cross-validation folds
+        study_name : str, optional
+            Name for the Optuna study (default: auto-generated)
+        show_progress_bar : bool
+            Whether to show progress bar during optimization (default: True)
+        """
+        if model_name not in self.VALID_MODELS:
+            raise ValueError(f"Unsupported model_name: {model_name}")        
+        
+        self.eval_metric = eval_metric
+        self.model_name = model_name
+        self.sampler = sampler
+        self.loss = loss        
+        self.class_weights = class_weights
+        self.n_trials = n_trials
+        self.random_state = random_state
+        self.use_gpu = use_gpu
+        self.n_splits = n_splits
+        self.study_name = study_name
+        self.show_progress_bar = show_progress_bar
+        
+        self.study: Optional[optuna.Study] = None
+        self.best_params: Optional[Dict] = None
+        
+        if sampler is not None and class_weights != [0.5, 0.5]:
+            warnings.warn(
+                "You set both a sampling method and non-default class_weights. "
+                "This can double-count imbalance handling."
+            )     
+    
+    def _create_sampler(self):
+        """Create a sampling object based on the sampler name."""
+        if self.sampler is None:
+            return None
+        
+        samplers = {
+            "SMOTE": SMOTE(random_state=self.random_state),
+            "ADASYN": ADASYN(random_state=self.random_state),
+            "RandomOverSampler": RandomOverSampler(random_state=self.random_state),
+            "TomekLinks": TomekLinks()
+        }
+        if self.sampler not in samplers:
+            raise ValueError(f"Unsupported sampler: {self.sampler}")
+        else: 
+            return samplers.get(self.sampler)
+    
+    def _score(
+        self, 
+        y_true: np.ndarray, 
+        y_pred_proba: np.ndarray, 
+        y_pred_label: np.ndarray
+    ) -> float:
+        """
+        Metric routing via dictionary (exact metric names, no strip/lower, no helpers).
 
-    valid_samplers = {None, "SMOTE", "ADASYN", "RandomOversampling", "TomekLinks"}
-    valid_models = {"XGBoost", "LightGBM", "CatBoost", "RandomForest"}
-    valid_metrics = {"auc", "aucpr", "f1", "accuracy", "logloss", "ing_hubs"}
+        Supported:
+          "roc_auc_score"            -> uses y_pred_proba
+          "average_precision_score"  -> uses y_pred_proba
+          "f1_score"                 -> uses y_pred_label
+          "accuracy_score"           -> uses y_pred_label
+          "log_loss"                 -> uses y_pred_proba
+          "ing_hubs_datathon_metric" -> ing_hubs_datathon_metric(y_true, y_pred_proba)
 
-    if sampler not in valid_samplers:
-        raise ValueError(f"sampler must be one of {valid_samplers}")
-    if model_name not in valid_models:
-        raise ValueError(f"model_name must be one of {valid_models}")
-    if eval_metric not in valid_metrics:
-        raise ValueError(f"eval_metric must be one of {valid_metrics}")
+        Unknown names or any exception -> returns NaN.
+        """
 
-    if sampler is not None and (class_weights != [0.5, 0.5]):
-        warnings.warn(
-            "You set both a sampling method and non-default class_weights. "
-            "This can double-count imbalance handling."
-        )
+        if not isinstance(self.eval_metric, str):
+            raise ValueError("eval_metric must be a string")
 
-    def make_sampler():
-        if sampler is None: return None
-        if sampler == "SMOTE": return SMOTE(random_state=random_state)
-        if sampler == "ADASYN": return ADASYN(random_state=random_state)
-        if sampler == "RandomOversampling": return RandomOverSampler(random_state=random_state)
-        if sampler == "TomekLinks": return TomekLinks()
-        return None
+        metric_dispatch = {
+            "roc_auc_score":            lambda yt, yp_proba, yp_lbl: roc_auc_score(yt, yp_proba),
+            "average_precision_score":  lambda yt, yp_proba, yp_lbl: average_precision_score(yt, yp_proba),
+            "f1_score":                 lambda yt, yp_proba, yp_lbl: f1_score(yt, yp_lbl),
+            "accuracy_score":           lambda yt, yp_proba, yp_lbl: accuracy_score(yt, yp_lbl),
+            "log_loss":                 lambda yt, yp_proba, yp_lbl: -1*log_loss(yt, yp_proba),
+            "ing_hubs_datathon_metric": lambda yt, yp_proba, yp_lbl: ing_hubs_datathon_metric(yt, yp_proba),
+        }
 
-    # Metric dispatcher
-    def score_fn(y_true, y_pred_proba, y_pred_label):
-        if eval_metric == "ing_hubs":
-            return ing_hubs_datathon_metric(y_true, y_pred_proba)
-        if eval_metric == "auc":
-            return roc_auc_score(y_true, y_pred_proba)
-        if eval_metric == "aucpr":
-            return average_precision_score(y_true, y_pred_proba)
-        if eval_metric == "f1":
-            return f1_score(y_true, y_pred_label)
-        if eval_metric == "accuracy":
-            return accuracy_score(y_true, y_pred_label)
-        if eval_metric == "logloss":
-            return -log_loss(y_true, y_pred_proba, labels=[0,1])  # higher is better
-        raise ValueError(f"Unsupported eval_metric: {eval_metric}")
+        fn = metric_dispatch.get(self.eval_metric)
+        if fn is None:
+            raise ValueError(f"Unsupported eval_metric: {self.eval_metric}")
 
-    def suggest_params(trial):
-        if model_name == "XGBoost":
-            params = dict(
-                objective = loss or "binary:logistic",
-                # keep a stable built-in metric for early stopping/monitoring
-                eval_metric = "auc",
-                n_estimators = trial.suggest_int("n_estimators", 200, 1200),
-                learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
-                max_depth = trial.suggest_int("max_depth", 3, 10),
-                min_child_weight = trial.suggest_float("min_child_weight", 1e-2, 10.0, log=True),
-                subsample = trial.suggest_float("subsample", 0.5, 1.0),
-                colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                gamma = trial.suggest_float("gamma", 0.0, 10.0),
-                reg_alpha = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                reg_lambda = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                max_bin = trial.suggest_int("max_bin", 128, 512),
-                tree_method = "gpu_hist" if use_gpu else "hist",
-                random_state = random_state,
-                n_jobs = -1,
-            )
+        try:
+            return float(fn(y_true, y_pred_proba, y_pred_label))
+        except Exception:
+            raise ValueError(f"Error computing metric: {self.eval_metric}")
+
+    
+    def _suggest_params(self, trial: optuna.Trial) -> Tuple[str, Dict[str, Any]]:
+        """
+        Suggest hyperparameters for the current trial.
+        
+        Returns:
+        --------
+        tuple : (model_key, parameters_dict)
+        """
+        if self.model_name == "XGBoost":
+            params = {
+                "objective": self.loss or "binary:logistic",
+                # eval_metric will use XGBoost's default for the objective
+                "n_estimators": trial.suggest_int("n_estimators", 200, 1200),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 1e-2, 10.0, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "gamma": trial.suggest_float("gamma", 0.0, 10.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "max_bin": trial.suggest_int("max_bin", 128, 512),
+                "tree_method": "gpu_hist" if self.use_gpu else "hist",
+                "early_stopping_rounds": 50,
+                "random_state": self.random_state,
+                "n_jobs": -1,
+            }
             return "xgb", params
-
-        if model_name == "LightGBM":
-            params = dict(
-                objective = loss or "binary",
-                n_estimators = trial.suggest_int("n_estimators", 300, 1500),
-                learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
-                num_leaves = trial.suggest_int("num_leaves", 16, 256),
-                max_depth = trial.suggest_int("max_depth", -1, 12),
-                min_child_samples = trial.suggest_int("min_child_samples", 5, 200),
-                subsample = trial.suggest_float("subsample", 0.5, 1.0),
-                colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                reg_alpha = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                reg_lambda = trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                random_state = random_state,
-                n_jobs = -1,
-                device = "gpu" if use_gpu else "cpu",
-            )
+        
+        elif self.model_name == "LightGBM":
+            params = {
+                "objective": self.loss or "binary",
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1500),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 16, 256),
+                "max_depth": trial.suggest_int("max_depth", -1, 12),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "random_state": self.random_state,
+                "n_jobs": -1,                
+                "device": "gpu" if self.use_gpu else "cpu",
+            }
             return "lgbm", params
-
-        if model_name == "CatBoost":
-            params = dict(
-                loss_function = loss or "Logloss",
-                eval_metric = "AUC",   # stable built-in metric
-                iterations = trial.suggest_int("iterations", 300, 1500),
-                learning_rate = trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
-                depth = trial.suggest_int("depth", 4, 10),
-                l2_leaf_reg = trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
-                bagging_temperature = trial.suggest_float("bagging_temperature", 0.0, 1.0),
-                random_seed = random_state,
-                verbose = False,
-                task_type = "GPU" if use_gpu else "CPU",
-            )
+        
+        elif self.model_name == "CatBoost":
+            params = {
+                "loss_function": self.loss or "Logloss",
+                # eval_metric will use CatBoost's default for the loss function
+                "iterations": trial.suggest_int("iterations", 300, 1500),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "depth": trial.suggest_int("depth", 4, 10),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+                "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+                "random_seed": self.random_state,
+                "verbose": False,
+                "early_stopping_rounds": 50,
+                "task_type": "GPU" if self.use_gpu else "CPU",
+            }
             return "cat", params
-
-        # RandomForest
-        params = dict(
-            n_estimators = trial.suggest_int("n_estimators", 200, 1000),
-            max_depth = trial.suggest_int("max_depth", 3, 30),
-            min_samples_split = trial.suggest_int("min_samples_split", 2, 20),
-            min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
-            max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
-            criterion = loss or "gini",   # "gini", "entropy", "log_loss"
-            n_jobs = -1,
-            random_state = random_state,
-        )
-        return "rf", params
-
-    def objective(trial):
-        model_key, params = suggest_params(trial)
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        
+        else:  # RandomForest
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+                "max_depth": trial.suggest_int("max_depth", 3, 30),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+                "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+                "criterion": self.loss or "gini",
+                "n_jobs": -1,
+                "random_state": self.random_state,
+            }
+            return "rf", params
+    
+    def _train_fold(
+        self,
+        model_key: str,
+        params: Dict[str, Any],
+        X_tr: np.ndarray,
+        y_tr: np.ndarray,
+        X_va: np.ndarray,
+        y_va: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Train model on a single fold and return predictions.
+        
+        Returns:
+        --------
+        tuple : (y_pred_proba, y_pred_label)
+        """
+        # Calculate sample weights if needed
+        sample_weight = None
+        if self.class_weights != [0.5, 0.5]:
+            w0, w1 = self.class_weights
+            sample_weight = np.zeros_like(y_tr, dtype=float)
+            sample_weight[y_tr == 0] = w0
+            sample_weight[y_tr == 1] = w1
+        
+        # Calculate scale_pos_weight for imbalance handling
+        neg = (y_tr == 0).sum()
+        pos = (y_tr == 1).sum()
+        scale_pos_weight = float(neg) / float(pos) if pos > 0 else 1.0
+        
+        if model_key == "xgb":
+            xgb_params = params.copy()
+            if self.sampler is None and self.class_weights == [0.5, 0.5]:
+                xgb_params["scale_pos_weight"] = scale_pos_weight
+            
+            clf = XGBClassifier(**xgb_params)
+            clf.fit(
+                X_tr, y_tr,
+                sample_weight=sample_weight,
+                eval_set=[(X_va, y_va)],
+                verbose=False,
+            )
+            proba = clf.predict_proba(X_va)[:, 1]
+            yhat = (proba >= 0.5).astype(int)
+        
+        elif model_key == "lgbm":
+            lgbm_params = params.copy()
+            if self.class_weights != [0.5, 0.5]:
+                lgbm_params["class_weight"] = {0: self.class_weights[0], 1: self.class_weights[1]}
+            elif self.sampler is None:
+                lgbm_params["scale_pos_weight"] = scale_pos_weight
+            
+            clf = LGBMClassifier(**lgbm_params)
+            clf.fit(
+                X_tr, y_tr,
+                sample_weight=sample_weight,
+                eval_set=[(X_va, y_va)],
+                callbacks=[early_stopping(50), log_evaluation(0)]
+            )
+            proba = clf.predict_proba(X_va)[:, 1]
+            yhat = (proba >= 0.5).astype(int)
+        
+        elif model_key == "cat":
+            clf = CatBoostClassifier(**params)
+            if self.class_weights != [0.5, 0.5]:
+                clf.set_params(class_weights=self.class_weights)
+            
+            # Note: CatBoost custom metrics require different setup
+            # For simplicity, using built-in metrics during training
+            clf.fit(
+                X_tr, y_tr,
+                sample_weight=sample_weight,
+                eval_set=[(X_va, y_va)],
+                use_best_model=True,
+                verbose=False
+            )
+            proba = clf.predict_proba(X_va)[:, 1]
+            yhat = (proba >= 0.5).astype(int)
+        
+        else:  # RandomForest
+            rf_params = params.copy()
+            if self.class_weights != [0.5, 0.5]:
+                rf_params["class_weight"] = {0: self.class_weights[0], 1: self.class_weights[1]}
+            
+            clf = RandomForestClassifier(**rf_params)
+            clf.fit(X_tr, y_tr, sample_weight=sample_weight)
+            proba = clf.predict_proba(X_va)[:, 1]
+            yhat = (proba >= 0.5).astype(int)
+        
+        return proba, yhat
+    
+    def _objective(self, trial: optuna.Trial, X: np.ndarray, y: np.ndarray) -> float:
+        """
+        Objective function for Optuna optimization.
+        
+        Returns:
+        --------
+        float : Mean cross-validation score
+        """
+        model_key, params = self._suggest_params(trial)
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
         scores = []
-
-        for tr_idx, va_idx in skf.split(X, y):
+        
+        for fold_idx, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
             X_tr, X_va = X[tr_idx], X[va_idx]
             y_tr, y_va = y[tr_idx], y[va_idx]
-
-            # Optional resampling on TRAIN ONLY
-            sampler_obj = make_sampler()
+            
+            # Apply sampling if specified (only on training set)
+            sampler_obj = self._create_sampler()
             if sampler_obj is not None:
                 try:
                     X_tr, y_tr = sampler_obj.fit_resample(X_tr, y_tr)
                 except Exception as e:
-                    warnings.warn(f"Sampler {sampler} failed on this fold ({e}). Skipping sampling.")
-
-            # Class weights as sample weights (optional)
-            sample_weight = None
-            if class_weights is not None:
-                w0, w1 = class_weights
-                if (w0, w1) != (0.5, 0.5):
-                    sw = np.zeros_like(y_tr, dtype=float)
-                    sw[y_tr == 0] = w0
-                    sw[y_tr == 1] = w1
-                    sample_weight = sw
-
-            # scale_pos_weight for boosting (only if not double-counting)
-            neg = (y_tr == 0).sum()
-            pos = (y_tr == 1).sum()
-            scale_pos_weight = float(neg) / float(pos) if pos > 0 else 1.0
-
-            if model_key == "xgb":
-                xgb_params = params.copy()
-                if sampler is None and (class_weights == [0.5, 0.5]):
-                    xgb_params["scale_pos_weight"] = scale_pos_weight
-
-                clf = XGBClassifier(**xgb_params)
-                clf.fit(
-                    X_tr, y_tr,
-                    sample_weight=sample_weight,
-                    eval_set=[(X_va, y_va)],   # built-in AUC logged; our metric computed after
-                    verbose=False,
-                    early_stopping_rounds=50
-                )
-                proba = clf.predict_proba(X_va)[:, 1]
-                yhat = (proba >= 0.5).astype(int)
-
-            elif model_key == "lgbm":
-                from lightgbm import early_stopping, log_evaluation
-
-                lgbm_params = params.copy()
-                if (class_weights != [0.5, 0.5]):
-                    lgbm_params["class_weight"] = {0: class_weights[0], 1: class_weights[1]}
-                elif sampler is None:
-                    lgbm_params["scale_pos_weight"] = scale_pos_weight
-
-                clf = LGBMClassifier(**lgbm_params)
-
-                # If you're optimizing ing_hubs and want per-iteration tracking in LightGBM:
-                def lgb_ing_hubs_feval(y_pred, dataset):
-                    y_true = dataset.get_label()
-                    return ("ing_hubs", ing_hubs_datathon_metric(y_true, y_pred), True)
-
-                eval_metric_lgb = ["auc"]
-                if eval_metric == "ing_hubs":
-                    eval_metric_lgb = [lgb_ing_hubs_feval, "auc"]
-
-                clf.fit(
-                    X_tr, y_tr,
-                    sample_weight=sample_weight,
-                    eval_set=[(X_va, y_va)],
-                    eval_metric=eval_metric_lgb,
-                    callbacks=[early_stopping(50), log_evaluation(0)]
-                )
-                proba = clf.predict_proba(X_va)[:, 1]
-                yhat = (proba >= 0.5).astype(int)
-
-            elif model_key == "cat":
-                clf = CatBoostClassifier(**params)
-                if (class_weights != [0.5, 0.5]):
-                    clf.set_params(class_weights=[class_weights[0], class_weights[1]])
-
-                clf.fit(
-                    X_tr, y_tr,
-                    sample_weight=sample_weight,
-                    eval_set=[(X_va, y_va)],
-                    use_best_model=True,
-                    verbose=False
-                )
-                proba = clf.predict_proba(X_va)[:, 1]
-                yhat = (proba >= 0.5).astype(int)
-
-            else:
-                rf_params = params.copy()
-                if (class_weights != [0.5, 0.5]):
-                    rf_params["class_weight"] = {0: class_weights[0], 1: class_weights[1]}
-                clf = RandomForestClassifier(**rf_params)
-                clf.fit(X_tr, y_tr, sample_weight=sample_weight)
-                proba = clf.predict_proba(X_va)[:, 1]
-                yhat = (proba >= 0.5).astype(int)
-
-            score = score_fn(y_va, proba, yhat)
+                    warnings.warn(
+                        f"Sampler {self.sampler} failed on this fold ({e}). "
+                        "Skipping sampling."
+                    )
+            
+            # Train and predict
+            proba, yhat = self._train_fold(model_key, params, X_tr, y_tr, X_va, y_va)
+            
+            # Compute score
+            score = self._score(y_va, proba, yhat)
             scores.append(score)
-
+            
+            # Debug logging for first trial
+            if trial.number == 0 and fold_idx == 0:
+                print(f"\nStudy Name: {self.study_name}")                
+                print(f"  Train size: {len(y_tr)}, Val size: {len(y_va)}")
+                print(f"  Train class dist: {np.bincount(y_tr)}")
+                print(f"  Val class dist: {np.bincount(y_va)}")
+                print(f"  Pred proba range: [{proba.min():.4f}, {proba.max():.4f}]")
+                print(f"  Pred labels dist: {np.bincount(yhat)}")                
+        
         return float(np.mean(scores))
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=random_state),
-    )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    return study
+    
+    def optimize(self, X: np.ndarray, y: np.ndarray) -> optuna.Study:
+        """
+        Run hyperparameter optimization.
+        
+        Parameters:
+        -----------
+        X : array-like
+            Feature matrix
+        y : array-like
+            Binary target labels (0 and 1)
+            
+        Returns:
+        --------
+        optuna.Study : Completed Optuna study object
+        """
+        X = np.asarray(X)
+        y = np.asarray(y).astype(int)
+        
+        if set(np.unique(y)) != {0, 1}:
+            raise ValueError("Binary target {0, 1} expected.")
+        
+        # Set up custom logging format to show 2 decimal places
+        optuna.logging.disable_default_handler()
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        # Create study with optional name
+        self.study = optuna.create_study(
+            study_name=self.study_name,
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.random_state),
+        )
+        
+        # Custom callback to format output with 2 decimal places
+        def logging_callback(study, trial):
+            # Format value to 2 decimal places
+            value_str = f"{trial.value:.2f}"
+            best_value_str = f"{study.best_value:.2f}"
+            
+            # Format parameters to 2 decimal places
+            params_formatted = {}
+            for key, val in trial.params.items():
+                if isinstance(val, float):
+                    params_formatted[key] = f"{val:.2f}"
+                else:
+                    params_formatted[key] = val
+            
+            print(f"[I {trial.datetime_complete.strftime('%Y-%m-%d %H:%M:%S')}] "
+                  f"Trial {trial.number} finished with value: {value_str} and "
+                  f"parameters: {params_formatted}. Best is trial {study.best_trial.number} "
+                  f"with value: {best_value_str}.")
+        
+        self.study.optimize(
+            lambda trial: self._objective(trial, X, y),
+            n_trials=self.n_trials,
+            callbacks=[logging_callback],
+            show_progress_bar=self.show_progress_bar
+        )
+        
+        self.best_params = self.study.best_params
+        return self.study
+    
+    def get_best_params(self) -> Dict[str, Any]:
+        """Get the best hyperparameters found."""
+        if self.best_params is None:
+            raise ValueError("No optimization run yet. Call optimize() first.")
+        return self.best_params
