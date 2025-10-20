@@ -1,7 +1,9 @@
 from pathlib import Path
 import duckdb
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
 
 
 def get_repo_root(marker_files=(".git", "pyproject.toml", "requirements.txt", "setup.cfg", "README.md")) -> Path:
