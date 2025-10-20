@@ -83,14 +83,14 @@ class OptunaTuner:
     Optuna-based hyperparameter tuner for binary classification with sampling support.
     
     Features:
-    - Multiple models: XGBoost, LightGBM, CatBoost, RandomForest
+    - Multiple models: XGBoost, LightGBM, CatBoost, RandomForest, Ensemble
     - Sampling methods: SMOTE, ADASYN, RandomOversampling, TomekLinks
     - Flexible evaluation metrics (sklearn functions or custom callables)
     - Cross-validation with stratified k-fold
     """
     
     VALID_SAMPLERS = {None, "SMOTE", "ADASYN", "RandomOverSampler", "TomekLinks"}
-    VALID_MODELS = {"XGBoost", "LightGBM", "CatBoost", "RandomForest"}
+    VALID_MODELS = {"XGBoost", "LightGBM", "CatBoost", "RandomForest", "Ensemble"}
     
     def __init__(
         self,
@@ -112,7 +112,7 @@ class OptunaTuner:
         Parameters:
         -----------
         model_name : str
-            Model to use: "XGBoost", "LightGBM", "CatBoost", "RandomForest"
+            Model to use: "XGBoost", "LightGBM", "CatBoost", "RandomForest", "Ensemble"
         sampler : str, optional
             Sampling method: None, "SMOTE", "ADASYN", "RandomOverSampler", "TomekLinks"
         loss : str, optional
@@ -228,7 +228,32 @@ class OptunaTuner:
         --------
         tuple : (model_key, parameters_dict)
         """
-        if self.model_name == "XGBoost":
+        if self.model_name == "Ensemble":
+            # Suggest ensemble weights and individual model parameters
+            params = {
+                "weight_xgb": trial.suggest_float("weight_xgb", 0.0, 1.0),
+                "weight_rf": trial.suggest_float("weight_rf", 0.0, 1.0),
+                "weight_cat": trial.suggest_float("weight_cat", 0.0, 1.0),
+                # XGBoost params
+                "xgb_n_estimators": trial.suggest_int("xgb_n_estimators", 200, 1200),
+                "xgb_learning_rate": trial.suggest_float("xgb_learning_rate", 1e-3, 0.3, log=True),
+                "xgb_max_depth": trial.suggest_int("xgb_max_depth", 3, 10),
+                "xgb_subsample": trial.suggest_float("xgb_subsample", 0.5, 1.0),
+                "xgb_colsample_bytree": trial.suggest_float("xgb_colsample_bytree", 0.5, 1.0),
+                # RandomForest params
+                "rf_n_estimators": trial.suggest_int("rf_n_estimators", 200, 1000),
+                "rf_max_depth": trial.suggest_int("rf_max_depth", 3, 30),
+                "rf_min_samples_split": trial.suggest_int("rf_min_samples_split", 2, 20),
+                "rf_max_features": trial.suggest_categorical("rf_max_features", ["sqrt", "log2", None]),
+                # CatBoost params
+                "cat_iterations": trial.suggest_int("cat_iterations", 300, 1500),
+                "cat_learning_rate": trial.suggest_float("cat_learning_rate", 1e-3, 0.2, log=True),
+                "cat_depth": trial.suggest_int("cat_depth", 4, 10),
+                "cat_l2_leaf_reg": trial.suggest_float("cat_l2_leaf_reg", 1.0, 10.0),
+            }
+            return "ensemble", params
+        
+        elif self.model_name == "XGBoost":
             params = {
                 "objective": self.loss or "binary:logistic",
                 # eval_metric will use XGBoost's default for the objective
@@ -325,7 +350,82 @@ class OptunaTuner:
         pos = (y_tr == 1).sum()
         scale_pos_weight = float(neg) / float(pos) if pos > 0 else 1.0
         
-        if model_key == "xgb":
+        if model_key == "ensemble":
+            # Extract weights and normalize
+            w_xgb = params["weight_xgb"]
+            w_rf = params["weight_rf"]
+            w_cat = params["weight_cat"]
+            total_weight = w_xgb + w_rf + w_cat
+            
+            if total_weight == 0:
+                # If all weights are 0, use equal weights
+                w_xgb = w_rf = w_cat = 1.0 / 3.0
+            else:
+                w_xgb /= total_weight
+                w_rf /= total_weight
+                w_cat /= total_weight
+            
+            # Train XGBoost
+            xgb_params = {
+                "objective": self.loss or "binary:logistic",
+                "n_estimators": params["xgb_n_estimators"],
+                "learning_rate": params["xgb_learning_rate"],
+                "max_depth": params["xgb_max_depth"],
+                "subsample": params["xgb_subsample"],
+                "colsample_bytree": params["xgb_colsample_bytree"],
+                "tree_method": "gpu_hist" if self.use_gpu else "hist",
+                "random_state": self.random_state,
+                "n_jobs": -1,
+            }
+            if self.sampler is None and self.class_weights == [0.5, 0.5]:
+                xgb_params["scale_pos_weight"] = scale_pos_weight
+            
+            clf_xgb = XGBClassifier(**xgb_params)
+            clf_xgb.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_va, y_va)], verbose=False)
+            proba_xgb = clf_xgb.predict_proba(X_va)[:, 1]
+            
+            # Train RandomForest
+            rf_params = {
+                "n_estimators": params["rf_n_estimators"],
+                "max_depth": params["rf_max_depth"],
+                "min_samples_split": params["rf_min_samples_split"],
+                "max_features": params["rf_max_features"],
+                "criterion": self.loss or "gini",
+                "n_jobs": -1,
+                "random_state": self.random_state,
+            }
+            if self.class_weights != [0.5, 0.5]:
+                rf_params["class_weight"] = {0: self.class_weights[0], 1: self.class_weights[1]}
+            
+            clf_rf = RandomForestClassifier(**rf_params)
+            clf_rf.fit(X_tr, y_tr, sample_weight=sample_weight)
+            proba_rf = clf_rf.predict_proba(X_va)[:, 1]
+            
+            # Train CatBoost
+            cat_params = {
+                "loss_function": self.loss or "Logloss",
+                "iterations": params["cat_iterations"],
+                "learning_rate": params["cat_learning_rate"],
+                "depth": params["cat_depth"],
+                "l2_leaf_reg": params["cat_l2_leaf_reg"],
+                "random_seed": self.random_state,
+                "verbose": False,
+                "task_type": "GPU" if self.use_gpu else "CPU",
+            }
+            clf_cat = CatBoostClassifier(**cat_params)
+            if self.class_weights != [0.5, 0.5]:
+                clf_cat.set_params(class_weights=self.class_weights)
+            
+            clf_cat.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_va, y_va)], use_best_model=True, verbose=False)
+            proba_cat = clf_cat.predict_proba(X_va)[:, 1]
+            
+            # Weighted average ensemble
+            proba = w_xgb * proba_xgb + w_rf * proba_rf + w_cat * proba_cat
+            yhat = (proba >= 0.5).astype(int)
+            
+            return proba, yhat
+        
+        elif model_key == "xgb":
             xgb_params = params.copy()
             if self.sampler is None and self.class_weights == [0.5, 0.5]:
                 xgb_params["scale_pos_weight"] = scale_pos_weight
