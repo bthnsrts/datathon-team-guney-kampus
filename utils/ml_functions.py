@@ -281,7 +281,7 @@ class OptunaTuner:
         
         elif self.model_name == "LightGBM":
             params = {
-                "objective": self.loss or "binary",
+                "objective": "binary",
                 "n_estimators": trial.suggest_int("n_estimators", 300, 1500),
                 "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
                 "num_leaves": trial.suggest_int("num_leaves", 16, 256),
@@ -299,7 +299,7 @@ class OptunaTuner:
         
         elif self.model_name == "CatBoost":
             params = {
-                "loss_function": self.loss or "Logloss",
+                "loss_function": "Logloss",
                 # eval_metric will use CatBoost's default for the loss function
                 "iterations": trial.suggest_int("iterations", 300, 1500),
                 "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
@@ -320,7 +320,7 @@ class OptunaTuner:
                 "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
                 "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
-                "criterion": self.loss or "gini",
+                "criterion": "gini",
                 "n_jobs": -1,
                 "random_state": self.random_state,
             }

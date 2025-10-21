@@ -1,0 +1,27 @@
+{
+    "study_name": "RandomOverSampler_XGBClassifier_LogLoss_INGHubsMetric",
+    "model_name": "XGBoost",
+    "best_value": 1.1593152484081255,
+    "best_trial": 4,
+    "n_trials": 5,
+    "eval_metric": "ing_hubs_datathon_metric",
+    "sampler": "RandomOverSampler",
+    "class_weights": [
+        0.5,
+        0.5
+    ],
+    "random_state": 42,
+    "timestamp": "2025-10-21 18:13:06",
+    "best_params": {
+        "n_estimators": 322,
+        "learning_rate": 0.016850517723339092,
+        "max_depth": 3,
+        "min_child_weight": 5.345166110646818,
+        "subsample": 0.6293899908000085,
+        "colsample_bytree": 0.831261142176991,
+        "gamma": 3.1171107608941098,
+        "reg_alpha": 0.0004793052550782129,
+        "reg_lambda": 0.0008325158565947969,
+        "max_bin": 199
+    }
+}
