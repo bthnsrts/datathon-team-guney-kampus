@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Union, Any
 import numpy as np
 import optuna
 
@@ -104,7 +104,8 @@ class OptunaTuner:
         use_gpu: bool = False,
         n_splits: int = 5,
         study_name: Optional[str] = None,
-        show_progress_bar: bool = True
+        show_progress_bar: bool = True,
+        save_dir: str = "optuna_studies"
     ):
         """
         Initialize the OptunaTuner.
@@ -137,6 +138,8 @@ class OptunaTuner:
             Name for the Optuna study (default: auto-generated)
         show_progress_bar : bool
             Whether to show progress bar during optimization (default: True)
+        save_dir : str
+            Directory to save best parameters JSON file (default: "optuna_studies")
         """
         if model_name not in self.VALID_MODELS:
             raise ValueError(f"Unsupported model_name: {model_name}")        
@@ -152,9 +155,11 @@ class OptunaTuner:
         self.n_splits = n_splits
         self.study_name = study_name
         self.show_progress_bar = show_progress_bar
+        self.save_dir = save_dir
         
         self.study: Optional[optuna.Study] = None
         self.best_params: Optional[Dict] = None
+        self.fitted_model: Optional[Dict] = None  # Store trained models
         
         if sampler is not None and class_weights != [0.5, 0.5]:
             warnings.warn(
@@ -276,7 +281,7 @@ class OptunaTuner:
         
         elif self.model_name == "LightGBM":
             params = {
-                "objective": self.loss or "binary",
+                "objective": "binary",
                 "n_estimators": trial.suggest_int("n_estimators", 300, 1500),
                 "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
                 "num_leaves": trial.suggest_int("num_leaves", 16, 256),
@@ -294,7 +299,7 @@ class OptunaTuner:
         
         elif self.model_name == "CatBoost":
             params = {
-                "loss_function": self.loss or "Logloss",
+                "loss_function": "Logloss",
                 # eval_metric will use CatBoost's default for the loss function
                 "iterations": trial.suggest_int("iterations", 300, 1500),
                 "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
@@ -315,7 +320,7 @@ class OptunaTuner:
                 "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
                 "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
-                "criterion": self.loss or "gini",
+                "criterion": "gini",
                 "n_jobs": -1,
                 "random_state": self.random_state,
             }
@@ -590,10 +595,265 @@ class OptunaTuner:
         )
         
         self.best_params = self.study.best_params
+        
+        # Save best parameters to JSON file
+        self._save_best_params()
+        
         return self.study
+    
+    def _save_best_params(self):
+        """Save best parameters to a JSON file in the save directory."""
+        import json
+        import os
+        from datetime import datetime
+        
+        if self.best_params is None:
+            return
+        
+        # Create directory if it doesn't exist
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        # Generate filename
+        if self.study_name:
+            filename = f"{self.study_name}_best_params.json"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.model_name}_{timestamp}_best_params.json"
+        
+        filepath = os.path.join(self.save_dir, filename)
+        
+        # Prepare data to save
+        save_data = {
+            "study_name": self.study_name or "unnamed_study",
+            "model_name": self.model_name,
+            "best_value": float(self.study.best_value),
+            "best_trial": self.study.best_trial.number,
+            "n_trials": self.n_trials,
+            "eval_metric": self.eval_metric,
+            "sampler": self.sampler,
+            "class_weights": self.class_weights,
+            "random_state": self.random_state,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "best_params": self.best_params
+        }
+        
+        # Save to JSON
+        with open(filepath, 'w') as f:
+            json.dump(save_data, f, indent=4)
+        
+        print(f"✓ Best parameters saved to: {filepath}")
     
     def get_best_params(self) -> Dict[str, Any]:
         """Get the best hyperparameters found."""
         if self.best_params is None:
             raise ValueError("No optimization run yet. Call optimize() first.")
         return self.best_params
+    
+def fit_predict_best_study_from_json(
+    study_json: Dict[str, Any],
+    X: np.ndarray,
+    y: np.ndarray,
+    X_test: np.ndarray,
+    use_gpu: bool = False,
+) -> np.ndarray:
+    """
+    Load a saved Optuna study JSON (as path or dict), train the corresponding
+    model with its best_params on the full training data, and return probabilities
+    for X_test. Works without any class instance.
+
+    Parameters
+    ----------
+    study_json : str | dict
+        - Path to the JSON file produced by your tuner (e.g. *_best_params.json), or
+        - A Python dict with the same keys.
+    X : np.ndarray
+        Training features.
+    y : np.ndarray
+        Binary labels (0/1).
+    X_test : np.ndarray
+        Test features to predict probabilities on.
+    use_gpu : bool, optional
+        Try to use GPU where supported (XGBoost/CatBoost/LightGBM). Default False.
+
+    Returns
+    -------
+    np.ndarray
+        Predicted probabilities (class 1) for X_test.
+    """
+  
+    cfg = dict(study_json)
+
+    model_name: str = cfg.get("model_name", "XGBoost")
+    best_params: Dict[str, Any] = dict(cfg.get("best_params", {}))
+    class_weights = cfg.get("class_weights", [0.5, 0.5]) or [0.5, 0.5]
+    sampler_name: Optional[str] = cfg.get("sampler", None)
+    random_state: int = int(cfg.get("random_state", 42))
+
+    # --- Basic checks / coercions ---
+    X = np.asarray(X)
+    y = np.asarray(y).astype(int)
+    X_test = np.asarray(X_test)
+
+    if set(np.unique(y)) - {0, 1}:
+        raise ValueError("y must be binary (0/1).")
+
+    # --- Sampling note ---
+    # This standalone helper does NOT resample (SMOTE/ADASYN/etc.) to keep dependencies minimal.
+    # If you need that, do it upstream before calling this function.
+
+    # --- Compute optional sample weights & scale_pos_weight ---
+    sample_weight = None
+    if class_weights != [0.5, 0.5]:
+        w0, w1 = class_weights
+        sample_weight = np.zeros_like(y, dtype=float)
+        sample_weight[y == 0] = w0
+        sample_weight[y == 1] = w1
+
+    neg = int((y == 0).sum())
+    pos = int((y == 1).sum())
+    scale_pos_weight = float(neg) / float(pos) if pos > 0 else 1.0
+
+    # If the saved params accidentally include threading keys, we’ll keep reasonable defaults.
+    # (You can adjust here if you want finer control.)
+    # ---------------------------------------------------------------------
+
+    model = None
+    proba = None
+
+    if model_name in {"XGBoost", "XGBClassifier"}:
+        params = best_params.copy()
+        params.setdefault("objective", "binary:logistic")
+        params.setdefault("n_jobs", -1)
+        params["random_state"] = random_state
+        params["tree_method"] = "gpu_hist" if use_gpu else params.get("tree_method", "hist")
+
+        # Only add scale_pos_weight if you didn't already encode class imbalance via class weights
+        # and you didn't use a sampler.
+        if sampler_name is None and class_weights == [0.5, 0.5] and "scale_pos_weight" not in params:
+            params["scale_pos_weight"] = scale_pos_weight
+
+        model = XGBClassifier(**params)
+        model.fit(X, y, sample_weight=sample_weight, verbose=False)
+        proba = model.predict_proba(X_test)[:, 1]
+
+    elif model_name in {"LightGBM", "LGBM", "LGBMClassifier"}:
+        params = best_params.copy()
+        params.setdefault("objective", "binary")
+        params.setdefault("random_state", random_state)
+        params.setdefault("n_jobs", -1)
+        # LightGBM CPU by default; set device only if provided or if you want to force:
+        params.setdefault("device", "gpu" if use_gpu else "cpu")
+
+        # If user provided custom class weights, pass them; else consider scale_pos_weight.
+        if class_weights != [0.5, 0.5]:
+            params["class_weight"] = {0: class_weights[0], 1: class_weights[1]}
+            params.pop("scale_pos_weight", None)
+        elif sampler_name is None:
+            params.setdefault("scale_pos_weight", scale_pos_weight)
+
+        model = LGBMClassifier(**params)
+        model.fit(X, y, sample_weight=sample_weight)
+        proba = model.predict_proba(X_test)[:, 1]
+
+    elif model_name in {"CatBoost", "CatBoostClassifier"}:
+        params = best_params.copy()
+        params.setdefault("loss_function", "Logloss")
+        params.setdefault("random_seed", random_state)
+        params.setdefault("verbose", False)
+        params["task_type"] = "GPU" if use_gpu else "CPU"
+
+        model = CatBoostClassifier(**params)
+        # CatBoost accepts class_weights directly (safer than manual sample_weight for imbalance).
+        if class_weights != [0.5, 0.5]:
+            model.set_params(class_weights=class_weights)
+
+        model.fit(X, y, sample_weight=sample_weight, verbose=False)
+        proba = model.predict_proba(X_test)[:, 1]
+
+    elif model_name in {"RandomForest", "RandomForestClassifier"}:
+        params = best_params.copy()
+        params.setdefault("criterion", "gini")
+        params.setdefault("n_jobs", -1)
+        params.setdefault("random_state", random_state)
+
+        if class_weights != [0.5, 0.5]:
+            params["class_weight"] = {0: class_weights[0], 1: class_weights[1]}
+
+        model = RandomForestClassifier(**params)
+        model.fit(X, y, sample_weight=sample_weight)
+        proba = model.predict_proba(X_test)[:, 1]
+
+    elif model_name == "Ensemble":
+        # Optional: support a simple weighted ensemble if present in JSON.
+        # Expect keys: weight_xgb, weight_rf, weight_cat + sub-params for each model.
+        # If not found, raise a clear error.
+        bp = best_params
+        missing = [k for k in ("weight_xgb", "weight_rf", "weight_cat") if k not in bp]
+        if missing:
+            raise ValueError(f"Ensemble selected but missing keys in best_params: {missing}")
+
+        wx, wr, wc = bp["weight_xgb"], bp["weight_rf"], bp["weight_cat"]
+        s = wx + wr + wc
+        if s <= 0:
+            wx = wr = wc = 1.0 / 3.0
+        else:
+            wx, wr, wc = wx / s, wr / s, wc / s
+
+        # XGB
+        xgb_params = {
+            "objective": "binary:logistic",
+            "tree_method": "gpu_hist" if use_gpu else "hist",
+            "random_state": random_state,
+            "n_jobs": -1,
+            "n_estimators": bp.get("xgb_n_estimators", 500),
+            "learning_rate": bp.get("xgb_learning_rate", 0.05),
+            "max_depth": bp.get("xgb_max_depth", 5),
+            "subsample": bp.get("xgb_subsample", 0.8),
+            "colsample_bytree": bp.get("xgb_colsample_bytree", 0.8),
+        }
+        if sampler_name is None and class_weights == [0.5, 0.5]:
+            xgb_params["scale_pos_weight"] = scale_pos_weight
+        xgb = XGBClassifier(**xgb_params).fit(X, y, sample_weight=sample_weight, verbose=False)
+        p_xgb = xgb.predict_proba(X_test)[:, 1]
+
+        # RF
+        rf_params = {
+            "n_estimators": bp.get("rf_n_estimators", 400),
+            "max_depth": bp.get("rf_max_depth", 12),
+            "min_samples_split": bp.get("rf_min_samples_split", 2),
+            "max_features": bp.get("rf_max_features", "sqrt"),
+            "criterion": "gini",
+            "n_jobs": -1,
+            "random_state": random_state,
+        }
+        if class_weights != [0.5, 0.5]:
+            rf_params["class_weight"] = {0: class_weights[0], 1: class_weights[1]}
+        rf = RandomForestClassifier(**rf_params).fit(X, y, sample_weight=sample_weight)
+        p_rf = rf.predict_proba(X_test)[:, 1]
+
+        # Cat
+        cat_params = {
+            "loss_function": "Logloss",
+            "iterations": bp.get("cat_iterations", 800),
+            "learning_rate": bp.get("cat_learning_rate", 0.05),
+            "depth": bp.get("cat_depth", 6),
+            "l2_leaf_reg": bp.get("cat_l2_leaf_reg", 3.0),
+            "random_seed": random_state,
+            "verbose": False,
+            "task_type": "GPU" if use_gpu else "CPU",
+        }
+        cat = CatBoostClassifier(**cat_params)
+        if class_weights != [0.5, 0.5]:
+            cat.set_params(class_weights=class_weights)
+        cat.fit(X, y, sample_weight=sample_weight, verbose=False)
+        p_cat = cat.predict_proba(X_test)[:, 1]
+
+        proba = wx * p_xgb + wr * p_rf + wc * p_cat
+
+    else:
+        raise ValueError(f"Unsupported model_name in JSON: {model_name}")
+
+    if proba is None:
+        raise RuntimeError("Failed to produce probabilities.")
+    print(f"✓ {model_name} trained on {len(y)} samples using saved best_params")
+    return proba
