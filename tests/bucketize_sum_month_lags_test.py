@@ -10,8 +10,8 @@ import pandas as pd
 
 from utils import bucketize_sum_month_lags, get_repo_root
 
-INPUT_PATH = str(get_repo_root()) + "/tests/data/bucketize_sum_month_lags_input.csv"
-EXPECTED_PATH = str(get_repo_root()) + "/tests/data/bucketize_sum_month_lags_expected.csv"
+INPUT_PATH = str(get_repo_root()) + "/tests/test_data/bucketize_sum_month_lags_input.csv"
+EXPECTED_PATH = str(get_repo_root()) + "/tests/test_data/bucketize_sum_month_lags_expected.csv"
 
 BUCKETS = {
     "l0m": (0, 0),
